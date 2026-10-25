@@ -1,0 +1,14 @@
+{
+  "theme": "dark",
+  "defaultThinkingLevel": "medium",
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 24000
+  },
+  "hideThinkingBlock": false,
+  "retry": {
+    "maxRetries": 3,
+    "baseDelayMs": 30000
+  }
+}

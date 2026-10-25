@@ -1,0 +1,44 @@
+{
+  "name": "pi-harness",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts && python3 -m unittest discover -s tests -p '*_test.py'",
+    "docwriter": "tsx scripts/docwriter.ts"
+  },
+  "pi": {
+    "extensions": ["./extensions", "!./extensions/co-change-suggest.ts", "!./extensions/continuation-nudge.ts"],
+    "skills": [
+      "./skills/tdd",
+      "./skills/diagnosing-bugs",
+      "./skills/resolving-merge-conflicts",
+      "./skills/grill",
+      "./skills/local-summarize",
+      "./skills/docs-verify",
+      "./skills/pre-pr-review",
+      "./skills/live-validation",
+      "./skills/before-done",
+      "./skills/wiring-verify"
+    ],
+    "prompts": ["./prompts"]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
+    "@types/node": "24.1.0",
+    "tsx": "4.20.3",
+    "typebox": "1.3.7",
+    "typescript": "5.8.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

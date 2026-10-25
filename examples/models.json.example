@@ -1,0 +1,12 @@
+{
+  "providers": {
+    "local": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "not-required",
+      "models": [
+        { "id": "qwen2.5-coder:32b" }
+      ]
+    }
+  }
+}

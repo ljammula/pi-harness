@@ -1,0 +1,152 @@
+import type {
+	ExecOptions,
+	ExecResult,
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionEvent,
+} from "@earendil-works/pi-coding-agent";
+
+type EventType = ExtensionEvent["type"];
+type Handler = (event: any, context: ExtensionContext) => unknown | Promise<unknown>;
+
+export interface ExecCall {
+	command: string;
+	args: string[];
+	options?: ExecOptions;
+}
+
+export interface HarnessOptions {
+	cwd?: string;
+	exec?: (call: ExecCall) => ExecResult | Promise<ExecResult>;
+	appendEntry?: (type: string, data: unknown) => void;
+	branch?: any[];
+	activeTools?: string[];
+	/** Backing value for `ctx.isIdle()`. Defaults to false (agent mid-run) --
+	 *  the common case for extensions reacting to in-flight events. */
+	idle?: boolean;
+}
+
+export interface RegisteredCommandCall {
+	name: string;
+	options: any;
+}
+
+export class ExtensionHarness {
+	readonly entries: { type: string; data: unknown }[] = [];
+	readonly execCalls: ExecCall[] = [];
+	readonly messages: { content: unknown; options: unknown }[] = [];
+	readonly notifications: { message: string; type: string | undefined }[] = [];
+	private abortCallCount = 0;
+
+	get abortCalls(): number {
+		return this.abortCallCount;
+	}
+	readonly handlers = new Map<EventType, Handler[]>();
+	readonly commands = new Map<string, RegisteredCommandCall["options"]>();
+	readonly tools = new Map<string, any>();
+	readonly api: ExtensionAPI;
+	readonly context: ExtensionContext;
+	private activeTools: string[];
+	idle: boolean;
+
+	constructor(options: HarnessOptions = {}) {
+		this.activeTools = options.activeTools ?? [];
+		this.idle = options.idle ?? false;
+		const branch = options.branch ?? [];
+		this.context = {
+			cwd: options.cwd ?? "/workspace",
+			hasUI: false,
+			signal: new AbortController().signal,
+			isIdle: () => this.idle,
+			sessionManager: {
+				getLeafEntry: () => branch.at(-1),
+				getBranch: () => branch,
+			} as any,
+			ui: {
+				notify: (message: string, type?: string) => {
+					this.notifications.push({ message, type });
+				},
+				select: async () => undefined,
+				confirm: async () => false,
+				input: async () => undefined,
+				// Pass-through stubs: real styling doesn't matter for behavior
+				// tests, but extensions that touch the footer (plan-mode.ts's
+				// updateStatus) need these to exist at all to run through the
+				// harness without throwing.
+				setStatus: () => undefined,
+				setWidget: () => undefined,
+				theme: {
+					fg: (_style: string, text: string) => text,
+					strikethrough: (text: string) => text,
+				},
+			} as any,
+			// Command-handler-only members (ExtensionCommandContext), stubbed here too
+			// so commands registered via registerCommand can be exercised directly.
+			waitForIdle: async () => undefined,
+			abort: () => {
+				this.abortCallCount += 1;
+			},
+		} as unknown as ExtensionContext;
+
+		this.api = {
+			on: (event: EventType, handler: Handler) => {
+				const handlers = this.handlers.get(event) ?? [];
+				handlers.push(handler);
+				this.handlers.set(event, handlers);
+			},
+			exec: async (command: string, args: string[], execOptions?: ExecOptions) => {
+				const call = { command, args, options: execOptions };
+				this.execCalls.push(call);
+				return options.exec?.(call) ?? { code: 0, stdout: "", stderr: "" };
+			},
+			appendEntry: (type: string, data?: unknown) => {
+				options.appendEntry?.(type, data);
+				this.entries.push({ type, data });
+			},
+			sendUserMessage: (content: unknown, messageOptions?: unknown) =>
+				this.messages.push({ content, options: messageOptions }),
+			getActiveTools: () => [...this.activeTools],
+			setActiveTools: (tools: string[]) => {
+				this.activeTools = [...tools];
+			},
+			// Reflects tools actually registered via registerTool() so far, same
+			// as the real pi runtime -- was hardcoded to [], which meant any
+			// extension checking "is tool X currently registered" via
+			// getAllTools() (e.g. plan-mode's before_agent_start hook) could
+			// never be tested truthfully against this harness.
+			getAllTools: () => [...this.tools.values()],
+			registerProvider: () => undefined,
+			registerTool: (toolDef: any) => {
+				this.tools.set(toolDef.name, toolDef);
+			},
+			registerCommand: (name: string, commandOptions: any) => {
+				this.commands.set(name, commandOptions);
+			},
+			registerShortcut: () => undefined,
+			registerFlag: () => undefined,
+			getFlag: () => undefined,
+			registerMessageRenderer: () => undefined,
+			registerEntryRenderer: () => undefined,
+			sendMessage: () => undefined,
+		} as unknown as ExtensionAPI;
+	}
+
+	async emit<T extends ExtensionEvent>(event: T): Promise<unknown[]> {
+		const results: unknown[] = [];
+		for (const handler of this.handlers.get(event.type) ?? []) {
+			results.push(await handler(event, this.context));
+		}
+		return results;
+	}
+
+	getActiveTools(): string[] {
+		return [...this.activeTools];
+	}
+
+	/** Invoke a previously registered command's handler with this harness's context. */
+	invokeCommand(name: string, args: string): Promise<void> {
+		const command = this.commands.get(name);
+		if (!command) throw new Error(`no command registered: ${name}`);
+		return command.handler(args, this.context);
+	}
+}

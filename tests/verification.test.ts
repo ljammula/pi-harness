@@ -1,0 +1,298 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import {
+	commandSatisfiesCanonical,
+	evidencePassesCurrentDiff,
+	explainVerificationMasking,
+	isBroadVerificationCommand,
+	packageJsonScriptChecks,
+	resolveVerificationCommand,
+	snapshotDiff,
+	verificationPipelineCanMaskFailure,
+} from "../extensions/lib/verification.ts";
+import { ExtensionHarness } from "./extension-api-harness.ts";
+
+test("recognizes broad project verification commands", () => {
+	assert.equal(isBroadVerificationCommand("make verify"), true);
+	assert.equal(isBroadVerificationCommand("go test ./..."), true);
+	assert.equal(isBroadVerificationCommand("gofmt -w main.go"), false);
+});
+
+test("recognizes go test with allowlisted non-narrowing flags", () => {
+	assert.equal(isBroadVerificationCommand("go test -race ./..."), true);
+	assert.equal(isBroadVerificationCommand("go test -race -v ./..."), true);
+	assert.equal(isBroadVerificationCommand("go test -count=1 ./..."), true);
+	assert.equal(isBroadVerificationCommand("go test -timeout=60s ./..."), true);
+	assert.equal(isBroadVerificationCommand("go test -timeout 60s ./..."), true);
+	assert.equal(isBroadVerificationCommand("go test -parallel=4 ./..."), true);
+});
+
+test("does not recognize go test flags that narrow test scope", () => {
+	assert.equal(isBroadVerificationCommand("go test -run TestFoo ./..."), false);
+	assert.equal(isBroadVerificationCommand("go test -short ./..."), false);
+	assert.equal(isBroadVerificationCommand("go test -list . ./..."), false);
+});
+
+test("recognizes plain dart test alongside flutter test", () => {
+	assert.equal(isBroadVerificationCommand("dart test"), true);
+	assert.equal(isBroadVerificationCommand("flutter test"), true);
+});
+
+test("recognizes make test and make check alongside make verify", () => {
+	assert.equal(isBroadVerificationCommand("make test"), true);
+	assert.equal(isBroadVerificationCommand("make check"), true);
+	assert.equal(isBroadVerificationCommand("make build"), false);
+});
+
+test("piped verification is inconclusive unless pipefail is set", () => {
+	assert.equal(verificationPipelineCanMaskFailure("go test ./... | tail -20"), true);
+	assert.equal(verificationPipelineCanMaskFailure("set -o pipefail; go test ./... | tail -20"), false);
+	assert.equal(verificationPipelineCanMaskFailure("echo 'go test ./... | tail'"), false);
+});
+
+test("shell control flow cannot disguise a failed verification exit", () => {
+	assert.equal(verificationPipelineCanMaskFailure("npm test; echo EXIT=$?"), true);
+	assert.equal(verificationPipelineCanMaskFailure("npm test || true"), true);
+	assert.equal(verificationPipelineCanMaskFailure("! npm test"), true);
+	assert.equal(verificationPipelineCanMaskFailure("npm test & echo waiting"), true);
+	assert.equal(verificationPipelineCanMaskFailure("npm test 2>&1"), false);
+	assert.equal(verificationPipelineCanMaskFailure("npm test; # trailing separator"), false);
+	assert.equal(verificationPipelineCanMaskFailure("npm test && echo passed"), false);
+});
+
+// explainVerificationMasking is verificationPipelineCanMaskFailure's
+// reason-carrying sibling, added for progress-stall-guard.ts's intercept
+// text -- it needs to name the actual mechanism, not just a yes/no.
+test("explainVerificationMasking names the specific masking mechanism", () => {
+	assert.deepEqual(explainVerificationMasking("go test ./... | tail -20"), { masks: true, reason: "unguarded-pipe" });
+	assert.deepEqual(explainVerificationMasking("set -o pipefail; go test ./... | tail -20"), { masks: false });
+	assert.deepEqual(explainVerificationMasking("npm test; echo EXIT=$?"), { masks: true, reason: "trailing-command" });
+	assert.deepEqual(explainVerificationMasking("npm test || true"), { masks: true, reason: "or-fallback" });
+	assert.deepEqual(explainVerificationMasking("! npm test"), { masks: true, reason: "negated" });
+	assert.deepEqual(explainVerificationMasking("npm test & echo waiting"), { masks: true, reason: "backgrounded" });
+	assert.deepEqual(explainVerificationMasking("npm test && echo passed"), { masks: false });
+});
+
+test("verificationPipelineCanMaskFailure stays consistent with explainVerificationMasking's masks flag", () => {
+	for (const command of [
+		"go test ./... | tail -20",
+		"set -o pipefail; go test ./... | tail -20",
+		"npm test; echo EXIT=$?",
+		"npm test || true",
+		"! npm test",
+		"npm test & echo waiting",
+		"npm test 2>&1",
+		"npm test && echo passed",
+	]) {
+		assert.equal(verificationPipelineCanMaskFailure(command), explainVerificationMasking(command).masks, command);
+	}
+});
+
+test("only evidence for the current non-truncated diff passes", () => {
+	const evidence = { command: "make verify", diffHash: "a", startedAt: 1, endedAt: 2, exitCode: 0, truncated: false };
+	assert.equal(evidencePassesCurrentDiff(evidence, { hash: "a", material: true }), true);
+	assert.equal(evidencePassesCurrentDiff(evidence, { hash: "b", material: true }), false);
+	assert.equal(evidencePassesCurrentDiff({ ...evidence, truncated: true }, { hash: "a", material: true }), false);
+	assert.equal(evidencePassesCurrentDiff(evidence, { hash: "a", material: false }), false);
+});
+
+test("snapshot identity changes with untracked content and sees committed-since-base diffs", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-snapshot-"));
+	const path = join(cwd, "new file.txt");
+	await writeFile(path, "one");
+	const untrackedHarness = new ExtensionHarness({
+		cwd,
+		exec: ({ args }) => args[0] === "diff"
+			? { code: 0, stdout: "", stderr: "", killed: false }
+			: { code: 0, stdout: "?? new file.txt\0", stderr: "", killed: false },
+	});
+	const first = await snapshotDiff(untrackedHarness.api, cwd, "base");
+	await writeFile(path, "two");
+	const second = await snapshotDiff(untrackedHarness.api, cwd, "base");
+	assert.equal(first.material, true);
+	assert.notEqual(first.hash, second.hash);
+
+	const committedHarness = new ExtensionHarness({
+		cwd,
+		exec: ({ args }) => args[0] === "diff"
+			? { code: 0, stdout: "committed diff", stderr: "", killed: false }
+			: { code: 0, stdout: "", stderr: "", killed: false },
+	});
+	assert.equal((await snapshotDiff(committedHarness.api, cwd, "base")).material, true);
+});
+
+test("snapshot hashes a symlink target without following its outside content", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-snapshot-link-"));
+	const outside = join(await mkdtemp(join(tmpdir(), "pi-snapshot-outside-")), "secret.txt");
+	await writeFile(outside, "secret one");
+	await symlink(outside, join(cwd, "linked-secret"));
+	const harness = new ExtensionHarness({
+		cwd,
+		exec: ({ args }) => args[0] === "diff"
+			? { code: 0, stdout: "", stderr: "", killed: false }
+			: { code: 0, stdout: "?? linked-secret\0", stderr: "", killed: false },
+	});
+	const first = await snapshotDiff(harness.api, cwd, "base");
+	await writeFile(outside, "secret two");
+	const second = await snapshotDiff(harness.api, cwd, "base");
+	assert.equal(first.hash, second.hash);
+});
+
+test("verification resolution prefers make verify", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-verify-"));
+	await writeFile(join(cwd, "Makefile"), "verify:\n\tgo test ./...\n");
+	await writeFile(join(cwd, "go.mod"), "module example.test\n");
+	assert.equal(await resolveVerificationCommand(cwd), "make verify");
+});
+
+test("verification resolution recognizes make test when there is no verify target", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-make-test-"));
+	await writeFile(join(cwd, "Makefile"), "test:\n\tgo test ./...\n");
+	await writeFile(join(cwd, "go.mod"), "module example.test\n");
+	assert.equal(await resolveVerificationCommand(cwd), "make test");
+});
+
+test("verification resolution recognizes make check when there is no verify or test target", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-make-check-"));
+	await writeFile(join(cwd, "Makefile"), "check:\n\tgo vet ./... && go test ./...\n");
+	assert.equal(await resolveVerificationCommand(cwd), "make check");
+});
+
+test("verification resolution still prefers make verify over make test when both exist", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-make-both-"));
+	await writeFile(join(cwd, "Makefile"), "test:\n\tgo test ./...\nverify: test\n\tgo vet ./...\n");
+	assert.equal(await resolveVerificationCommand(cwd), "make verify");
+});
+
+test("verification resolution falls back to manifests and can stay unconfigured", async () => {
+	const go = await mkdtemp(join(tmpdir(), "pi-go-"));
+	await writeFile(join(go, "go.mod"), "module example.test\n");
+	assert.equal(await resolveVerificationCommand(go), "go vet ./... && go test ./...");
+	const empty = await mkdtemp(join(tmpdir(), "pi-empty-"));
+	assert.equal(await resolveVerificationCommand(empty), undefined);
+});
+
+test("verification resolution finds nested manifests when the root has none", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-nested-"));
+	await mkdir(join(cwd, "go"), { recursive: true });
+	await writeFile(join(cwd, "go", "go.mod"), "module example.test\n");
+	await mkdir(join(cwd, "flutter_app"), { recursive: true });
+	await writeFile(
+		join(cwd, "flutter_app", "pubspec.yaml"),
+		"name: app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+	);
+	assert.equal(
+		await resolveVerificationCommand(cwd),
+		"(cd 'flutter_app' && flutter test ) && (cd 'go' && go vet ./... && go test ./... )",
+	);
+});
+
+test("a pubspec.yaml without the flutter SDK dependency resolves to dart test, not flutter test", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-plain-dart-"));
+	await writeFile(join(cwd, "pubspec.yaml"), "name: a_dart_library\ndependencies:\n  http: ^1.2.0\n");
+	assert.equal(await resolveVerificationCommand(cwd), "dart test");
+});
+
+test("nested manifest scan picks dart test for a plain-Dart package next to a Go module", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-nested-plain-dart-"));
+	await mkdir(join(cwd, "server"), { recursive: true });
+	await writeFile(join(cwd, "server", "go.mod"), "module example.test\n");
+	await mkdir(join(cwd, "client"), { recursive: true });
+	await writeFile(join(cwd, "client", "pubspec.yaml"), "name: client\ndependencies:\n  http: ^1.2.0\n");
+	assert.equal(
+		await resolveVerificationCommand(cwd),
+		"(cd 'client' && dart test ) && (cd 'server' && go vet ./... && go test ./... )",
+	);
+});
+
+test("verification resolution ignores build and dependency trees while scanning nested manifests", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-nested-ignored-"));
+	await mkdir(join(cwd, "node_modules", "pkg"), { recursive: true });
+	await writeFile(join(cwd, "node_modules", "pkg", "package.json"), "{}\n");
+	assert.equal(await resolveVerificationCommand(cwd), undefined);
+});
+
+test("snapshot falls back to the empty tree when HEAD is unborn, instead of going unavailable", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-unborn-"));
+	const harness = new ExtensionHarness({
+		cwd,
+		exec: ({ args }) => {
+			if (args[0] === "rev-parse") return { code: 128, stdout: "", stderr: "unknown revision", killed: false };
+			if (args[0] === "diff") {
+				assert.equal(args[2], "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+				return { code: 0, stdout: "diff against empty tree", stderr: "", killed: false };
+			}
+			return { code: 0, stdout: "?? new_file.go\0", stderr: "", killed: false };
+		},
+	});
+	const snapshot = await snapshotDiff(harness.api, cwd, undefined);
+	assert.equal(snapshot.material, true);
+	assert.notEqual(snapshot.hash, "unavailable");
+});
+
+test("snapshot uses HEAD directly once a commit exists, without probing rev-parse unnecessarily when baseSha is known", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-born-"));
+	const revParseCalls: string[][] = [];
+	const harness = new ExtensionHarness({
+		cwd,
+		exec: ({ args }) => {
+			if (args[0] === "rev-parse") revParseCalls.push(args);
+			if (args[0] === "diff") {
+				assert.equal(args[2], "committed-base-sha");
+				return { code: 0, stdout: "", stderr: "", killed: false };
+			}
+			return { code: 0, stdout: "", stderr: "", killed: false };
+		},
+	});
+	await snapshotDiff(harness.api, cwd, "committed-base-sha");
+	assert.equal(revParseCalls.length, 0);
+});
+
+test("commandSatisfiesCanonical requires an exact match for a compound canonical", () => {
+	assert.equal(commandSatisfiesCanonical("go vet ./... && go test ./...", "go vet ./... && go test ./..."), true);
+	assert.equal(commandSatisfiesCanonical("go test ./...", "go vet ./... && go test ./..."), false);
+	assert.equal(commandSatisfiesCanonical("make verify", "make verify"), true);
+	assert.equal(commandSatisfiesCanonical("npm test; echo EXIT=$?", "make verify"), false);
+});
+
+test("commandSatisfiesCanonical rejects an operator that could neutralize an earlier segment's exit code", () => {
+	// Segment-wise containment alone would accept this: both "go vet ./..."
+	// and "go test ./..." appear, but "|| true" makes the overall exit code
+	// 0 even if vet fails -- the exact bypass this check exists to close.
+	assert.equal(
+		commandSatisfiesCanonical("go vet ./... || true && go test ./...", "go vet ./... && go test ./..."),
+		false,
+	);
+});
+
+test("commandSatisfiesCanonical requires a nested monorepo canonical to match exactly, not fragment-by-fragment", () => {
+	const canonical = "(cd 'client' && dart test ) && (cd 'server' && go vet ./... && go test ./... )";
+	assert.equal(commandSatisfiesCanonical(canonical, canonical), true);
+	assert.equal(commandSatisfiesCanonical("go test ./...", canonical), false);
+});
+
+test("packageJsonScriptChecks surfaces typecheck/lint scripts npm test doesn't run itself", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-verify-pkg-"));
+	await writeFile(
+		join(cwd, "package.json"),
+		JSON.stringify({ scripts: { test: "node test.js", typecheck: "tsc --noEmit", lint: "eslint ." } }),
+	);
+	assert.deepEqual(await packageJsonScriptChecks(cwd), [
+		{ name: "typecheck", command: "npm run typecheck" },
+		{ name: "lint", command: "npm run lint" },
+	]);
+});
+
+test("packageJsonScriptChecks ignores scripts outside its typecheck/lint allowlist", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-verify-pkg-"));
+	await writeFile(join(cwd, "package.json"), JSON.stringify({ scripts: { test: "node test.js", build: "tsc" } }));
+	assert.deepEqual(await packageJsonScriptChecks(cwd), []);
+});
+
+test("packageJsonScriptChecks is a no-op without a package.json", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-verify-pkg-"));
+	assert.deepEqual(await packageJsonScriptChecks(cwd), []);
+});
